@@ -164,13 +164,19 @@ export default async function (req) {
     if (focus) brokers = brokers.filter((b) => cleanDomain(b.domain) === focus);
     if (brokers.length === 0) return Response.json({ error: 'Unknown broker.' }, { status: 400 });
 
+    // A sequential pass over the whole registry would outlast the function
+    // timeout. Twenty per run, most-likely-to-answer first, and say so.
+    const requested = brokers.length;
+    const capped = brokers.slice(0, 20);
+
     const parts = buildParts(profile);
     const place = (Array.isArray(profile.addresses) && profile.addresses[0]) || profile.country || '';
     const candidates = [];
     const unverified = [];
     let provider = 'direct';
 
-    for (const broker of brokers) {
+
+    for (const broker of capped) {
       const domain = cleanDomain(broker.domain);
       const path = SEARCH_PATHS[domain];
       const searchUrl = path ? path(parts) : null;
@@ -250,7 +256,7 @@ export default async function (req) {
     return Response.json({
       summary,
       provider,
-      sites_checked: brokers.length,
+      sites_checked: capped.length,
       candidates,
       unverified
     });
