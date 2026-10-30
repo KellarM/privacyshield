@@ -244,6 +244,49 @@ export default function Scan() {
         </div>
       )}
 
+      {result && Array.isArray(result.removal_only) && result.removal_only.length > 0 && (
+        <div className="mt-10 border-t border-border pt-6">
+          <h3 className="font-display text-[17px] tracking-tight">
+            {result.removal_only.length} broker
+            {result.removal_only.length === 1 ? '' : 's'} publish no public search
+          </h3>
+          <p className="mt-2 max-w-2xl text-[13px] leading-relaxed text-muted-foreground">
+            These hold data but publish no page where you can look yourself up, so there is nothing
+            for a scan to find. The only action that matters is a removal request, drafted from your
+            exposure profile.
+          </p>
+          <ul className="mt-5 border-t border-border">
+            {result.removal_only.map((broker) => (
+              <li
+                key={broker.broker_domain}
+                className="flex flex-wrap items-center justify-between gap-3 border-b border-border py-3"
+              >
+                <div className="min-w-0">
+                  <p className="font-display text-[14px] tracking-tight">{broker.broker_name}</p>
+                  <p className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+                    Removal only
+                  </p>
+                </div>
+                {broker.opt_out_url ? (
+                  <a
+                    href={broker.opt_out_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary underline underline-offset-4"
+                  >
+                    Removal page
+                  </a>
+                ) : (
+                  <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+                    No link
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {!result && !running && (
         <div className="mt-10 rounded-sm border border-border bg-card p-6">
           <p className="text-[13px] leading-relaxed text-muted-foreground">
