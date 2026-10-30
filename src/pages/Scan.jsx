@@ -198,6 +198,48 @@ export default function Scan() {
               })}
             </ul>
           )}
+
+          {Array.isArray(result.unverified) && result.unverified.length > 0 && (
+            <div className="mt-10 border-t border-border pt-6">
+              <h3 className="font-display text-[17px] tracking-tight">
+                {result.unverified.length} {result.unverified.length === 1 ? 'site' : 'sites'} block automated checks
+              </h3>
+              <p className="mt-2 max-w-2xl text-[13px] leading-relaxed text-muted-foreground">
+                These refuse a server-side request, so a machine cannot honestly claim you are not
+                listed there. Open each one, look for your name and city, and add anything you find
+                to your removals. It takes a few seconds per site.
+              </p>
+              <ul className="mt-5 border-t border-border">
+                {result.unverified.map((site) => (
+                  <li
+                    key={site.broker_domain}
+                    className="flex flex-wrap items-center justify-between gap-3 border-b border-border py-3"
+                  >
+                    <div className="min-w-0">
+                      <p className="font-display text-[14px] tracking-tight">{site.broker_name}</p>
+                      <p className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+                        {site.reason}
+                      </p>
+                    </div>
+                    {site.search_url ? (
+                      <a
+                        href={site.search_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary underline underline-offset-4"
+                      >
+                        Check by hand
+                      </a>
+                    ) : (
+                      <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+                        No link
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
 

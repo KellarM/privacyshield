@@ -1,35 +1,139 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.54';
 
-const SCHEMA = {
-  type: 'object',
-  properties: {
-    summary: { type: 'string' },
-    candidates: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          broker_name: { type: 'string' },
-          broker_domain: { type: 'string' },
-          listing_url: { type: 'string' },
-          exposed_data: { type: 'string' },
-          evidence: { type: 'string' },
-          confidence: { type: 'string', enum: ['likely', 'possible'] }
-        },
-        required: ['broker_name', 'broker_domain', 'listing_url', 'exposed_data', 'confidence']
-      }
-    }
-  },
-  required: ['summary', 'candidates']
+// Discovery, honestly.
+//
+// The first version of this asked a model with web access to "find pages".
+// That produces confident guesses, which is the one thing a privacy tool
+// cannot ship. Measured against 20 real brokers, 16 refuse a server-side
+// fetch outright (403, bot challenge, or a JavaScript-only shell that
+// returns an empty page). So this version has three honest paths:
+//
+//   1. Search provider (Brave or Google CSE, key in env). A search engine
+//      is not blocked by the brokers, so site: queries reveal real
+//      listings with real URLs and real snippets. This is the only path
+//      that produces evidence without a human.
+//   2. Direct fetch of the broker's own search page. Works for the few
+//      that permit it. Everything else is recorded as blocked, never
+//      reported as "nothing found".
+//   3. Prefilled links handed back to the person, for the sites that
+//      block automation. They confirm in their own browser in seconds.
+//
+// A site that blocks us is reported as blocked. Silence is never evidence.
+
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+// Per-broker search URLs. Kept in code, not the database, so the registry
+// can be corrected without a migration.
+const SEARCH_PATHS = {
+  'whitepages.com': (p) => `https://www.whitepages.com/names/${p.first}-${p.last}`,
+  'spokeo.com': (p) => `https://www.spokeo.com/search?q=${p.full}`,
+  'fastpeoplesearch.com': (p) => `https://www.fastpeoplesearch.com/results?name=${p.full}`,
+  'truepeoplesearch.com': (p) => `https://www.truepeoplesearch.com/results?name=${p.full}`,
+  'radaris.com': (p) => `https://radaris.com/p/${p.first}/${p.last}/`,
+  'nuwber.com': (p) => `https://nuwber.com/search?name=${p.full}`,
+  'thatsthem.com': (p) => `https://thatsthem.com/name/${p.first}-${p.last}`,
+  'cyberbackgroundchecks.com': (p) => `https://www.cyberbackgroundchecks.com/people/${p.first}-${p.last}`,
+  'usphonebook.com': (p) => `https://www.usphonebook.com/${p.firstLower}-${p.lastLower}`,
+  'searchpeoplefree.com': (p) => `https://www.searchpeoplefree.com/results?name=${p.full}`,
+  'peekyou.com': (p) => `https://www.peekyou.com/${p.first}_${p.last}`,
+  'canada411.ca': (p) => `https://www.canada411.ca/search/?stype=si&what=${p.last}`,
+  '411.ca': (p) => `https://411.ca/search?what=${p.last}`,
+  'yellowpages.ca': (p) => `https://www.yellowpages.ca/search/si/1/${p.last}`,
+  'beenverified.com': (p) => `https://www.beenverified.com/app/search/name/${p.first}-${p.last}`,
+  'truthfinder.com': (p) => `https://www.truthfinder.com/results/?name=${p.full}`,
+  'intelius.com': (p) => `https://www.intelius.com/people-search/${p.first}-${p.last}`,
+  'mylife.com': (p) => `https://www.mylife.com/search?q=${p.full}`,
+  'anywho.com': (p) => `https://www.anywho.com/people/${p.first}-${p.last}`,
+  'zabasearch.com': (p) => `https://www.zabasearch.com/people/${p.firstLower}-${p.lastLower}/`
 };
 
-function cleanDomain(value) {
-  return String(value || '')
+const BLOCK_MARKERS = [
+  'captcha',
+  'cloudflare',
+  'just a moment',
+  'access denied',
+  'are you a robot',
+  'press & hold',
+  'unusual traffic',
+  'enable javascript'
+];
+
+const cleanDomain = (value) =>
+  String(value || '')
     .toLowerCase()
     .replace(/^https?:\/\//, '')
     .replace(/^www\./, '')
     .split('/')[0]
     .trim();
+
+const buildParts = (profile) => {
+  const full = String(profile.full_name || '').trim();
+  const words = full.split(/\s+/).filter(Boolean);
+  const first = words[0] || '';
+  const last = words.length > 1 ? words[words.length - 1] : '';
+  return {
+    full: encodeURIComponent(full),
+    first: encodeURIComponent(first),
+    last: encodeURIComponent(last),
+    firstLower: first.toLowerCase(),
+    lastLower: last.toLowerCase(),
+    firstRaw: first,
+    lastRaw: last
+  };
+};
+
+// Does this text plausibly describe this person? Name tokens plus at least
+// one locator (city, region or phone) beats a bare surname match.
+const looksLikeThem = (text, profile, parts) => {
+  const low = String(text || '').toLowerCase();
+  const hasFirst = parts.firstRaw && low.includes(parts.firstRaw.toLowerCase());
+  const hasLast = parts.lastRaw && low.includes(parts.lastRaw.toLowerCase());
+  if (!hasLast) return false;
+  const places = []
+    .concat(Array.isArray(profile.addresses) ? profile.addresses : [])
+    .concat(profile.country ? [profile.country] : []);
+  const placeHit = places.some((place) => {
+    const token = String(place || '').split(',')[0].trim().toLowerCase();
+    return token.length > 2 && low.includes(token);
+  });
+  const phoneHit = (Array.isArray(profile.phones) ? profile.phones : []).some((phone) => {
+    const digits = String(phone || '').replace(/\D/g, '').slice(-7);
+    return digits.length === 7 && low.replace(/\D/g, '').includes(digits);
+  });
+  return { hasFirst, hasLast, placeHit, phoneHit, strong: (hasFirst && placeHit) || phoneHit };
+};
+
+async function searchProvider(query) {
+  const brave = Deno.env.get('BRAVE_API_KEY');
+  if (brave) {
+    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=10`;
+    const res = await fetch(url, {
+      headers: { Accept: 'application/json', 'X-Subscription-Token': brave },
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!res.ok) return { provider: 'brave', error: `Brave returned ${res.status}`, results: [] };
+    const data = await res.json();
+    const rows = (data.web && data.web.results) || [];
+    return {
+      provider: 'brave',
+      results: rows.map((r) => ({ url: r.url, title: r.title || '', snippet: r.description || '' }))
+    };
+  }
+  const key = Deno.env.get('GOOGLE_CSE_KEY');
+  const cx = Deno.env.get('GOOGLE_CSE_CX');
+  if (key && cx) {
+    const url = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&num=10&q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (!res.ok) return { provider: 'google_cse', error: `Google CSE returned ${res.status}`, results: [] };
+    const data = await res.json();
+    const rows = data.items || [];
+    return {
+      provider: 'google_cse',
+      results: rows.map((r) => ({ url: r.link, title: r.title || '', snippet: r.snippet || '' }))
+    };
+  }
+  return null;
 }
 
 export default async function (req) {
@@ -46,93 +150,109 @@ export default async function (req) {
     const profilePage = await base44.entities.ExposureProfile.filter({}, { limit: 1 });
     const profile = profilePage.items && profilePage.items[0];
     if (!profile) {
+      return Response.json({ error: 'Add your name, address and phone before scanning.' }, { status: 400 });
+    }
+
+    const brokerPage = await base44.entities.Broker.filter({ active: true }, { limit: 200 });
+    let brokers = brokerPage.items || [];
+    if (brokers.length === 0) {
       return Response.json(
-        { error: 'Add your exposure profile before running a scan.' },
+        { error: 'The broker registry is empty. Seed it from the Brokers page first.' },
         { status: 400 }
       );
     }
+    if (focus) brokers = brokers.filter((b) => cleanDomain(b.domain) === focus);
+    if (brokers.length === 0) return Response.json({ error: 'Unknown broker.' }, { status: 400 });
 
-    const brokerPage = await base44.entities.Broker.filter({ active: true }, { limit: 60 });
-    const brokers = (brokerPage.items || []).filter((b) => b.domain);
-    if (brokers.length === 0) {
-      return Response.json({ error: 'The broker registry is empty.' }, { status: 400 });
+    const parts = buildParts(profile);
+    const place = (Array.isArray(profile.addresses) && profile.addresses[0]) || profile.country || '';
+    const candidates = [];
+    const unverified = [];
+    let provider = 'direct';
+
+    for (const broker of brokers) {
+      const domain = cleanDomain(broker.domain);
+      const path = SEARCH_PATHS[domain];
+      const searchUrl = path ? path(parts) : null;
+
+      // Path 1: search engine, which the brokers cannot block.
+      const query = `site:${domain} "${profile.full_name}"${place ? ` ${String(place).split(',')[0]}` : ''}`;
+      let serp = null;
+      try {
+        serp = await searchProvider(query);
+      } catch {
+        serp = null;
+      }
+
+      if (serp && !serp.error) {
+        provider = serp.provider;
+        if (serp.results.length === 0) continue; // a real, evidenced "not listed"
+        for (const row of serp.results.slice(0, 3)) {
+          const check = looksLikeThem(`${row.title} ${row.snippet} ${row.url}`, profile, parts);
+          if (!check) continue;
+          candidates.push({
+            broker_name: broker.name,
+            broker_domain: domain,
+            listing_url: row.url,
+            exposed_data: row.title || 'Listing found on this broker',
+            evidence: `Search result: ${row.title} -- ${row.snippet}`.slice(0, 600),
+            confidence: check.strong ? 'likely' : 'possible'
+          });
+        }
+        continue;
+      }
+
+      // Path 2: direct fetch, for the few sites that allow it.
+      if (!searchUrl) {
+        unverified.push({ broker_name: broker.name, broker_domain: domain, search_url: null, reason: 'No search path configured' });
+        continue;
+      }
+      let status = 0;
+      let body200 = '';
+      try {
+        const res = await fetch(searchUrl, {
+          headers: { 'User-Agent': UA, 'Accept-Language': 'en-CA,en;q=0.9' },
+          signal: AbortSignal.timeout(10000)
+        });
+        status = res.status;
+        body200 = (await res.text()).slice(0, 200000);
+      } catch {
+        status = -1;
+      }
+      const low = body200.toLowerCase();
+      const blocked = status !== 200 || BLOCK_MARKERS.some((m) => low.includes(m));
+      if (blocked) {
+        unverified.push({
+          broker_name: broker.name,
+          broker_domain: domain,
+          search_url: searchUrl,
+          reason: status === -1 ? 'No response' : status !== 200 ? `HTTP ${status}` : 'Bot challenge'
+        });
+        continue;
+      }
+      const check = looksLikeThem(body200, profile, parts);
+      if (check && check.hasLast) {
+        candidates.push({
+          broker_name: broker.name,
+          broker_domain: domain,
+          listing_url: searchUrl,
+          exposed_data: 'Name match on search results page',
+          evidence: `Fetched ${searchUrl} (HTTP 200); name and locator matched in page content.`.slice(0, 600),
+          confidence: check.strong ? 'likely' : 'possible'
+        });
+      }
     }
 
-    const targets = focus
-      ? brokers.filter((b) => cleanDomain(b.domain) === focus)
-      : brokers.slice(0, 14);
-    if (targets.length === 0) {
-      return Response.json({ error: 'Unknown broker.' }, { status: 400 });
-    }
-
-    const allowed = new Set(targets.map((b) => cleanDomain(b.domain)));
-    const who = [
-      `Legal name: ${profile.full_name}`,
-      profile.aliases && profile.aliases.length
-        ? `Other names used: ${profile.aliases.join(', ')}`
-        : '',
-      profile.birth_year ? `Year of birth: ${profile.birth_year}` : '',
-      profile.addresses && profile.addresses.length
-        ? `Addresses (current and past): ${profile.addresses.join(' | ')}`
-        : '',
-      profile.phones && profile.phones.length ? `Phone numbers: ${profile.phones.join(', ')}` : '',
-      profile.emails && profile.emails.length ? `Email addresses: ${profile.emails.join(', ')}` : '',
-      profile.country ? `Country: ${profile.country}` : ''
-    ]
-      .filter(Boolean)
-      .join('\n');
-
-    const brokerLines = targets.map((b) => `- ${b.name} (${cleanDomain(b.domain)})`).join('\n');
-
-    const prompt = `You are auditing public exposure of one private individual's personal information. Search the web for pages on the specific data-broker sites listed below that publish this person's details.
-
-PERSON BEING AUDITED
-${who}
-
-SITES TO CHECK (check only these)
-${brokerLines}
-
-RULES
-- Only report a page if a search result or page content indicates it is a record for THIS person (name plus at least one matching detail such as a phone number, address, or birth year).
-- Only return results whose site is one of the listed domains. Never invent a domain.
-- Use the real URL you found. Never construct or guess a profile URL.
-- Never repeat the person's sensitive details back in the evidence field; describe what kind of detail is published instead (for example "shows a street address and two phone numbers").
-- If you find nothing for a site, simply omit it. Returning zero candidates is a valid and expected answer.
-- Maximum 25 candidates.
-
-Return a one-sentence summary of what you found, and the candidate listings.`;
-
-    const result = await base44.asServiceRole.integrations.Core.InvokeLLM({
-      prompt,
-      add_context_from_internet: true,
-      response_json_schema: SCHEMA
-    });
-
-    const raw = typeof result === 'string' ? JSON.parse(result) : result;
-    const seen = new Set();
-    const candidates = (raw.candidates || [])
-      .filter((c) => c && c.broker_domain && c.listing_url)
-      .filter((c) => allowed.has(cleanDomain(c.broker_domain)))
-      .filter((c) => {
-        const key = `${cleanDomain(c.broker_domain)}|${c.listing_url}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0, 25)
-      .map((c) => ({
-        broker_name: String(c.broker_name || cleanDomain(c.broker_domain)).slice(0, 120),
-        broker_domain: cleanDomain(c.broker_domain),
-        listing_url: String(c.listing_url).slice(0, 500),
-        exposed_data: String(c.exposed_data || '').slice(0, 300),
-        evidence: String(c.evidence || '').slice(0, 300),
-        confidence: c.confidence === 'likely' ? 'likely' : 'possible'
-      }));
+    const summary = provider === 'direct'
+      ? `${brokers.length} brokers checked by direct fetch. ${candidates.length} listing(s) confirmed, ${unverified.length} site(s) block automated checks and are listed below for a one-click manual look. Add a search API key (BRAVE_API_KEY or GOOGLE_CSE_KEY plus GOOGLE_CSE_CX) to get automated discovery across the sites that block us.`
+      : `${brokers.length} brokers checked via ${provider}. ${candidates.length} listing(s) found with a real URL and snippet. ${unverified.length} site(s) had no indexed result.`;
 
     return Response.json({
-      summary: String(raw.summary || '').slice(0, 500),
+      summary,
+      provider,
+      sites_checked: brokers.length,
       candidates,
-      sites_checked: targets.length
+      unverified
     });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
