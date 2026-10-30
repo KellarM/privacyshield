@@ -1,0 +1,72 @@
+{
+  "name": "Broker",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "domain": {
+      "type": "string"
+    },
+    "opt_out_url": {
+      "type": "string"
+    },
+    "removal_email": {
+      "type": "string"
+    },
+    "method": {
+      "type": "string",
+      "enum": [
+        "form",
+        "email",
+        "both"
+      ]
+    },
+    "requires_id": {
+      "type": "boolean"
+    },
+    "typical_days": {
+      "type": "number"
+    },
+    "difficulty": {
+      "type": "string",
+      "enum": [
+        "easy",
+        "medium",
+        "hard"
+      ]
+    },
+    "category": {
+      "type": "string"
+    },
+    "notes": {
+      "type": "string"
+    },
+    "active": {
+      "type": "boolean",
+      "default": true
+    }
+  },
+  "required": [
+    "name",
+    "domain"
+  ],
+  "rls": {
+    "read": {},
+    "create": {
+      "user_condition": {
+        "role": "admin"
+      }
+    },
+    "update": {
+      "user_condition": {
+        "role": "admin"
+      }
+    },
+    "delete": {
+      "user_condition": {
+        "role": "admin"
+      }
+    }
+  }
+}
