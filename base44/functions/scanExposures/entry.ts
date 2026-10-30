@@ -137,6 +137,7 @@ async function searchProvider(query) {
 }
 
 export default async function (req) {
+  const startedAt = Date.now();
   try {
     const base44 = createClientFromRequest(req);
     const user = await base44.auth
@@ -171,18 +172,20 @@ export default async function (req) {
 
     const parts = buildParts(profile);
     const place = (Array.isArray(profile.addresses) && profile.addresses[0]) || profile.country || '';
-    const candidates = [];
-    const unverified = [];
-    let provider = 'direct';
 
 
-    for (const broker of capped) {
+    // One broker after another was the bug. Twenty blocked sites at eight
+    // seconds each outlasts the function timeout, so the request died with
+    // nothing to show. Every broker is now checked side by side under a hard
+    // deadline, and whatever finishes is returned.
+    const deadline = Date.now() + 15000;
+
+    const checkOne = async (broker) => {
       const domain = cleanDomain(broker.domain);
       const path = SEARCH_PATHS[domain];
       const searchUrl = path ? path(parts) : null;
-
-      // Path 1: search engine, which the brokers cannot block.
       const query = `site:${domain} "${profile.full_name}"${place ? ` ${String(place).split(',')[0]}` : ''}`;
+
       let serp = null;
       try {
         serp = await searchProvider(query);
@@ -191,12 +194,11 @@ export default async function (req) {
       }
 
       if (serp && !serp.error) {
-        provider = serp.provider;
-        if (serp.results.length === 0) continue; // a real, evidenced "not listed"
+        const hits = [];
         for (const row of serp.results.slice(0, 3)) {
           const check = looksLikeThem(`${row.title} ${row.snippet} ${row.url}`, profile, parts);
           if (!check) continue;
-          candidates.push({
+          hits.push({
             broker_name: broker.name,
             broker_domain: domain,
             listing_url: row.url,
@@ -205,62 +207,115 @@ export default async function (req) {
             confidence: check.strong ? 'likely' : 'possible'
           });
         }
-        continue;
+        return { provider: serp.provider, hits, unverified: [] };
       }
 
-      // Path 2: direct fetch, for the few sites that allow it.
       if (!searchUrl) {
-        unverified.push({ broker_name: broker.name, broker_domain: domain, search_url: null, reason: 'No search path configured' });
-        continue;
+        return {
+          hits: [],
+          unverified: [{
+            broker_name: broker.name,
+            broker_domain: domain,
+            search_url: null,
+            reason: 'No search path configured'
+          }]
+        };
       }
+
       let status = 0;
-      let body200 = '';
+      let body = '';
       try {
         const res = await fetch(searchUrl, {
           headers: { 'User-Agent': UA, 'Accept-Language': 'en-CA,en;q=0.9' },
-          signal: AbortSignal.timeout(10000)
+          signal: AbortSignal.timeout(5000)
         });
         status = res.status;
-        body200 = (await res.text()).slice(0, 200000);
+        body = (await res.text()).slice(0, 200000);
       } catch {
         status = -1;
       }
-      const low = body200.toLowerCase();
+
+      const low = body.toLowerCase();
       const blocked = status !== 200 || BLOCK_MARKERS.some((m) => low.includes(m));
       if (blocked) {
-        unverified.push({
-          broker_name: broker.name,
-          broker_domain: domain,
-          search_url: searchUrl,
-          reason: status === -1 ? 'No response' : status !== 200 ? `HTTP ${status}` : 'Bot challenge'
-        });
-        continue;
+        return {
+          hits: [],
+          unverified: [{
+            broker_name: broker.name,
+            broker_domain: domain,
+            search_url: searchUrl,
+            reason: status === -1 ? 'No response' : status !== 200 ? `HTTP ${status}` : 'Bot challenge'
+          }]
+        };
       }
-      const check = looksLikeThem(body200, profile, parts);
-      if (check && check.hasLast) {
-        candidates.push({
-          broker_name: broker.name,
-          broker_domain: domain,
-          listing_url: searchUrl,
-          exposed_data: 'Name match on search results page',
-          evidence: `Fetched ${searchUrl} (HTTP 200); name and locator matched in page content.`.slice(0, 600),
-          confidence: check.strong ? 'likely' : 'possible'
-        });
-      }
+
+      const check = looksLikeThem(body, profile, parts);
+      const hits = check && check.hasLast
+        ? [{
+            broker_name: broker.name,
+            broker_domain: domain,
+            listing_url: searchUrl,
+            exposed_data: 'Name match on search results page',
+            evidence: `Fetched ${searchUrl} (HTTP 200); name and locator matched in page content.`.slice(0, 600),
+            confidence: check.strong ? 'likely' : 'possible'
+          }]
+        : [];
+      return { hits, unverified: [] };
+    };
+
+    const timedOut = (broker) => ({
+      hits: [],
+      unverified: [{
+        broker_name: broker.name,
+        broker_domain: cleanDomain(broker.domain),
+        search_url: null,
+        reason: 'Ran out of time this pass'
+      }]
+    });
+
+    const settled = await Promise.allSettled(
+      capped.map((broker) => {
+        const budget = deadline - Date.now();
+        if (budget <= 500) return Promise.resolve(timedOut(broker));
+        return Promise.race([
+          checkOne(broker),
+          new Promise((resolve) => setTimeout(() => resolve(timedOut(broker)), budget))
+        ]);
+      })
+    );
+
+    const candidates = [];
+    const unverified = [];
+    let provider = 'direct';
+    for (const outcome of settled) {
+      if (outcome.status !== 'fulfilled' || !outcome.value) continue;
+      if (outcome.value.provider) provider = outcome.value.provider;
+      candidates.push(...(outcome.value.hits || []));
+      unverified.push(...(outcome.value.unverified || []));
     }
 
-    const summary = provider === 'direct'
-      ? `${brokers.length} brokers checked by direct fetch. ${candidates.length} listing(s) confirmed, ${unverified.length} site(s) block automated checks and are listed below for a one-click manual look. Add a search API key (BRAVE_API_KEY or GOOGLE_CSE_KEY plus GOOGLE_CSE_CX) to get automated discovery across the sites that block us.`
-      : `${brokers.length} brokers checked via ${provider}. ${candidates.length} listing(s) found with a real URL and snippet. ${unverified.length} site(s) had no indexed result.`;
+    const keyed = provider === 'brave' || provider === 'google_cse';
+    const summary = keyed
+      ? `${capped.length} broker sites checked through ${provider}. ${candidates.length} listing(s) found with a real URL and snippet. Add brokers to the registry to widen the sweep.`
+      : `${candidates.length} listing(s) confirmed from page content. ${unverified.length} of ${capped.length} sites refuse automated checks, and each is listed below with a link so you can confirm it in seconds. Automated discovery across those sites needs a search API key (BRAVE_API_KEY, or GOOGLE_CSE_KEY with GOOGLE_CSE_CX).`;
 
     return Response.json({
       summary,
       provider,
+      keyed,
+      mode: keyed ? `search:${provider}` : 'direct:brokers-block-automation',
+      elapsed_ms: Date.now() - startedAt,
       sites_checked: capped.length,
       candidates,
       unverified
     });
   } catch (error) {
-    return Response.json({ error: error.message }, { status: 500 });
+    // Say what broke, in words the page can show. A privacy tool that answers
+    // "something went wrong" has told the person nothing.
+    const detail = error && error.message ? error.message : String(error);
+    return Response.json({
+      error: `The scan stopped early: ${detail}. Nothing was recorded, so nothing was lost.`,
+      elapsed_ms: Date.now() - startedAt
+    }, { status: 500 });
   }
 }

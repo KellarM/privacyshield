@@ -131,6 +131,7 @@ export default function Scan() {
             </h2>
             <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
               {result.sites_checked} sites checked
+              {typeof result.elapsed_ms === 'number' ? ` in ${(result.elapsed_ms / 1000).toFixed(1)}s` : ''}
             </span>
           </div>
 
